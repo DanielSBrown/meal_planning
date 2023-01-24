@@ -1,0 +1,71 @@
+---
+version: '3.8'
+
+volumes:
+  local_postgres_data: {}
+  pip: {}
+  python_bin: {}
+  yarn: {}
+  assets: {}
+
+services:
+  django:
+    stdin_open: true
+    tty: true
+    build:
+      context: .
+      dockerfile: ./.docker/local/django/Dockerfile
+    image: meal_planning_local_django
+    depends_on:
+      - postgres
+      - redis
+    volumes:
+      - .:/app:z
+      - pip:/usr/local/lib/python3.11
+      - python_bin:/usr/local/bin
+      - yarn:/app/node_modules
+      - assets:/app/static/assets
+    env_file:
+      - ./.docker/local/django/.env
+      - ./.docker/local/postgres/.env
+    ports:
+      - "8000:8000"
+      - "4444:4444"
+    entrypoint: ./.docker/local/django/entrypoint
+    command: ./.docker/local/django/start
+
+  postgres:
+    image: postgres:14.1
+    volumes:
+      - local_postgres_data:/var/lib/postgresql/data
+    env_file:
+      - ./.docker/local/postgres/.env
+
+  redis:
+    image: redis:6
+    container_name: redis
+
+  celeryworker:
+    image: meal_planning_local_django
+    depends_on:
+      - redis
+      - postgres
+    environment:
+      - COLUMNS=80
+    env_file:
+      - ./.docker/local/django/.env
+      - ./.docker/local/postgres/.env
+    volumes:
+      - .:/app:delegated
+      - pip:/usr/local/lib/python3.11
+      - python_bin:/usr/local/bin
+    command: [
+      'watchgod',
+      'celery.__main__.main',
+      '--args',
+      '-A',
+      'config.celery_app',
+      'worker',
+      '-l',
+      'INFO'
+    ]

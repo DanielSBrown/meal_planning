@@ -1,0 +1,18 @@
+# The CODEOWNERS file specifies people who will be automatically assigned to PRs
+# Codeowners can be removed from PRs just like any other assignee
+# For more infomation see https://blog.github.com/2017-07-06-introducing-code-owners/
+
+# These owner(s) will be the default owners for everything in the repo.
+# Unless a later match takes precedence, default owners will be
+# requested for review when someone opens a pull request.
+
+# Tech Lead:
+
+
+# Order is important. The last matching pattern takes the most precedence.
+# When someone opens a pull request that only modifies files matching a
+# pattern below, only the corresponding owner(s) will be requested for a
+# review, and not the default owner(s).
+
+# Directory Specific:
+# /apps/ @jacob-lowen @DanielSBrown

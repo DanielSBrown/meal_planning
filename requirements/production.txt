@@ -1,0 +1,6 @@
+-r base.txt
+
+python-dateutil==2.8.2
+Collectfast==2.2.0
+
+django-storages[boto3]==1.13.2

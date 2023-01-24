@@ -1,0 +1,601 @@
+#!/usr/bin/env bash
+
+#
+# deploy(1) - Minimalistic shell script to deploy Git repositories.
+# Released under the MIT License.
+#
+# https://github.com/visionmedia/deploy
+#
+
+VERSION="0.6.0"
+CONFIG=./etc/deploy/environments.conf
+LOG=/tmp/deploy.log
+REF=
+ENV=
+KEEP_RELEASES=8
+
+SLACK_CHANNEL="#rendr-viget-internal"
+SLACK_EMOJI=":house:"
+SLACK_URL="https://hooks.slack.com/services/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"
+
+release_name=
+release_path=
+
+#
+# Output usage information.
+#
+usage() {
+  cat <<-EOF
+
+Usage: deploy [options] <host> [command]
+
+Options:
+
+  -C, --chdir <path>         change the working directory to <path>
+  -c, --config <path>        set config path. defaults to $CONFIG
+  -V, --version              output program version
+  -h, --help                 output help information
+
+Commands:
+
+  dev                        deploy to all dev hosts
+  production                 deploy to all production hosts
+
+  setup                      run remote setup commands
+  config [key]               output config file or [key]
+  run <cmd>                  run the given <cmd>
+  connect                    open an ssh session to the host
+  [ref]                      deploy to [ref], the 'ref' setting, or latest tag
+
+Deploy Targets:
+
+  staging
+    staging-web
+    staging-worker
+
+EOF
+}
+
+cyan="\\033[0;36m"
+green="\\033[0;32m"
+red="\\033[0;31m"
+yellow="\\033[0;33m"
+nc="\\033[0m"
+
+puts() {
+  echo -e "$*"
+}
+
+puterr() {
+  echo -e "$@" >&2
+}
+
+log() {
+  puts "  → ${cyan}$*${nc}"
+}
+
+success() {
+  puts "${green}$*${nc}"
+}
+
+failure() {
+  puterr "${red}$*${nc}"
+}
+
+info() {
+  puts "${yellow}$*${nc}"
+}
+
+abort() {
+  if [ $# -gt 0 ]; then
+    puterr "$*"
+  fi
+
+  exit 1
+}
+
+#
+# Set configuration file <path>.
+#
+set_config_path() {
+  [[ -f "$1" ]] || abort "invalid --config path"
+  CONFIG="$1"
+}
+
+#
+# Check if config <section> exists.
+#
+config_section() {
+  grep "^\\[$1" "$CONFIG" &> /dev/null
+}
+
+#
+# Get config value by <key>.
+#
+config_get() {
+  local key="$1"
+
+  [[ -n "$key" ]] \
+    && grep "^\\[$ENV" -A 20 "$CONFIG" \
+    | grep "^$key" \
+    | head -n 1 \
+    | cut -d ' ' -f 2-999 \
+    | sed -E "s/^ +//"
+}
+
+#
+# Output version.
+#
+version() {
+  echo "$VERSION"
+}
+
+#
+# Return the ssh command to run.
+#
+ssh_command() {
+  local url
+  local key
+  local forward_agent
+  local port
+  local needs_tty
+  local control
+
+  url="$(config_get user)@$(config_get host)"
+  key="$(config_get key)"
+  forward_agent="$(config_get forward-agent)"
+  port="$(config_get port)"
+  needs_tty="$(config_get needs_tty)"
+
+  # Persist SSH connections for 60 seconds
+  control="  -o ControlMaster=auto"
+  control+=" -o ControlPath=tmp/sockets/%r@%h-%p"
+  control+=" -o ControlPersist=60"
+
+  [[ -n "$forward_agent" ]] && local agent="-A"
+  [[ -n "$key" ]]           && local identity="-i $key"
+  [[ -n "$port" ]]          && local port="-p $port"
+  [[ -n "$needs_tty" ]]     && local tty="-t"
+
+  echo "ssh $tty $agent $port $identity $control $url"
+}
+
+#
+# Run the given remote <cmd>.
+#
+run() {
+  local job
+  local cmd
+
+  job="$1"
+  cmd="$(ssh_command)"
+
+  echo "$cmd" "\"$job\"" >> $LOG
+
+  # shellcheck disable=SC2086
+  $cmd $job
+}
+
+#
+# Launch an interactive ssh console session.
+#
+connect() {
+  local path
+  local shell
+
+  path="$(config_get path)"
+  shell="$(ssh_command)"
+
+  echo "$shell"
+
+  # shellcheck disable=SC2086
+  exec $shell -t "cd $path; \$SHELL --login"
+}
+
+#
+# Output config or [key].
+#
+config() {
+  if [[ $# -eq 0 ]]; then
+    cat "$CONFIG"
+  else
+    config_get "$1"
+  fi
+}
+
+check-ssh-agent() {
+  if [ -z "$(config_get forward-agent)" ]; then
+    return
+  fi
+
+  if ssh-add -l | grep -q "agent has no identities"; then
+    failure "Unable to deploy"
+    puterr
+    puterr "This site deploys using SSH agent forwarding,"
+    puterr "but no identity was found in your local SSH agent."
+    puterr
+    puterr "To add your identity, run:"
+    puterr
+    puterr "  ssh-add"
+    puterr
+    puterr "and try again."
+
+    exit 1
+  fi
+}
+
+#
+# Run setup.
+#
+setup() {
+  local path
+  local repo
+
+  path=$(config_get path)
+  repo=$(config_get repo)
+
+  log "cloning $repo"
+  run "if [[ ! -d $path/shared/cached-copy/.git ]]; then git clone $repo $path/shared/cached-copy; fi"
+  [[ $? -eq 0 ]] || abort "failed to clone"
+
+  log "setup complete"
+}
+
+run_with_venv() {
+  local path
+  local cmd="$1"
+
+  path="$(config_get path)"
+
+  run "source $release_path/etc/deploy/activate_venv && \
+       cd $release_path && \
+       $1"
+}
+
+#
+# Deploy
+#
+deploy() {
+  local ref
+  local role
+  local path
+  local shared_path
+  local source_path
+  local releases_path
+
+  release_name="$(date +%Y%m%d%H%M%S)"
+  ref="$1"
+  role="$(config_get role)"
+  path="$(config_get path)"
+  shared_path="$path/shared"
+  source_path="$shared_path/cached-copy"
+  releases_path="$path/releases"
+  release_path="$releases_path/$release_name"
+
+  info "$ENV: deploying $ref"
+
+  log "checking SSH agent"
+  check-ssh-agent
+
+  # Fetch source
+  log "fetching updates"
+  run "cd $source_path && git fetch --all && git fetch --tags -f && git fetch origin refs/tags/*:refs/tags/* --prune"
+  [[ $? -eq 0 ]] || abort "fetch failed"
+
+  # Latest tag
+  if [[ -z "$ref" ]]; then
+    log "fetching latest tag"
+
+    ref=$(run "cd $source_path && git for-each-ref refs/tags \
+      --sort=-creatordate \
+      --format='%(refname)' \
+      --count=1 | cut -d '/' -f 3")
+
+    [[ $? -eq 0 ]] || abort "failed to determine latest tag"
+  fi
+
+  # Reset HEAD
+  log "resetting HEAD to $ref"
+  run "cd $source_path && git reset --hard $ref"
+  [[ $? -eq 0 ]] || abort "git reset failed"
+
+  # Create release
+  log "creating release $release_name"
+  run "mkdir $release_path"
+  [[ $? -eq 0 ]] || abort "failed to create $release_path"
+
+  run "rsync -lrpt --exclude=.git $source_path/ $release_path"
+  [[ $? -eq 0 ]] || abort "failed to copy source to $release_path"
+
+  revision=$(run "cd $source_path && git rev-parse --short HEAD")
+  run "echo $revision > $release_path/REVISION"
+
+  # Symlink shared resources
+  log "symlinking shared resources"
+  run "ln -sfn $shared_path/log $release_path/log && \
+       ln -sfn $shared_path/config/.env $release_path/.env"
+  [[ $? -eq 0 ]] || abort "failed to symlink resources"
+
+  # # Backup database
+  # log "backing up database"
+  # run "cd $release_path && \
+  #      eval \$(cat .env | grep DB) && \
+  #      mysqldump --no-tablespaces --single-transaction -h \"\$DB_SERVER\" -u \"\$DB_USER\" -p\"\$DB_PASSWORD\" \"\$DB_DATABASE\" | gzip > $release_path/backup-predeploy.sql.gz"
+  # [[ $? -eq 0 ]] || abort "failed to backup database"
+
+  # Install Python packages
+  log "installing python packages"
+  run_with_venv "pip install -q -r requirements/production.txt"
+  [[ $? -eq 0 ]] || abort "failed to install python packages"
+
+  if [ "$role" == "web" ]; then
+    # # Node modules
+    # log "installing node modules"
+    # run "cd $release_path && yarn install --quiet"
+    # [[ $? -eq 0 ]] || abort "failed to install node modules"
+
+    # # Build assets
+    # log "building assets"
+    # run "cd $release_path && yarn run build"
+    # [[ $? -eq 0 ]] || abort "failed to build assets"
+
+    # Collect static files
+    log "collecting static files"
+    run_with_venv "python manage.py collectstatic"
+    [[ $? -eq 0 ]] || abort "failed to collect static files"
+
+    # Run migrations
+    log "running migrations"
+    run_with_venv "python manage.py migrate"
+    [[ $? -eq 0 ]] || abort "failed to run migrations"
+  fi
+
+  # Symlink release
+  log "linking release"
+  run "ln -sfn $release_path $path/current"
+
+  log "create log file"
+  run "cd $release_path && touch log/django.log"
+
+  # Restart
+  if [ "$role" == "web" ]; then
+    log "restarting app"
+    run "mkdir -p $release_path/tmp && touch $release_path/tmp/restart.txt"
+  fi
+
+  if [ "$role" == "worker" ]; then
+    log "restarting worker"
+    run "sudo systemctl restart $(config_get celery_service)"
+  fi
+
+  # # Slack
+  # log "notifying slack"
+  # slack_notify
+
+  # Cleanup
+  log "cleaning previous releases (keeping $KEEP_RELEASES)"
+  run "ls -1dt $releases_path/* | tail -n +$((KEEP_RELEASES + 1)) | xargs rm -rf"
+  [[ $? -eq 0 ]] || putserr "failed to clean up previous releases"
+
+  # Done
+  success "$ENV: successfully deployed $ref"
+}
+
+#
+# Get current commit.
+#
+current_commit() {
+  local path
+  path="$(config_get path)"
+  run "cd $path/shared/cached-copy && git rev-parse HEAD"
+}
+
+commit_message() {
+  local commit
+  local path
+
+  commit="$1"
+  path="$(config_get path)"
+
+  run "cd $path/shared/cached-copy && git show --pretty=format:\"%s - %an\" HEAD | head -n 1"
+}
+
+#
+# Require environment arg.
+#
+require_env() {
+  config_section "$ENV" || abort "[$ENV] config section not defined"
+  [[ -z "$ENV" ]] && abort "<env> required"
+}
+
+#
+# Ensure all changes are committed and pushed before deploying.
+#
+check_for_local_changes() {
+  git --no-pager diff --exit-code --quiet          || abort "commit or stash your changes before deploying"
+  git --no-pager diff --exit-code --quiet --cached || abort "commit your staged changes before deploying"
+  [ -z "$(git rev-list "@{upstream}.." -n 1)" ]      || abort "push your changes before deploying"
+}
+
+#
+# Slack Notifier
+#
+slack_color() {
+  case "$ENV" in
+    integration)
+      echo "#d16d4e"
+      ;;
+    staging)
+      echo "#7c82d1"
+      ;;
+    *)
+      echo "#23d15a"
+      ;;
+  esac
+}
+
+slack_deployed_by_field() {
+  local user
+  user="$(git config --get user.name || echo "$USER")"
+
+  cat <<-END
+{
+  "title": "Deployed By",
+  "value": "$user",
+  "short": true
+}
+END
+}
+
+slack_branch_field() {
+  local branch
+  branch="$(config_get ref)"
+
+  cat <<-END
+{
+  "title": "Branch",
+  "value": "$branch",
+  "short": true
+}
+END
+}
+
+slack_site_field() {
+  local app_url
+  app_url="$(config_get slack_app_url)"
+
+  if [[ -z "$app_url" ]]; then
+    echo "{}"
+  else
+    cat <<-END
+{
+  "title": "URL",
+  "value": "$app_url",
+  "short": false
+}
+END
+  fi
+}
+
+slack_payload() {
+  local commit
+  local message
+
+  commit="$(current_commit)"
+  message="$(commit_message "$commit")"
+
+  cat <<-END | tr '\n' ' '
+{
+  "channel": "$SLACK_CHANNEL",
+  "username": "Deploy to $ENV",
+  "icon_emoji": "$SLACK_EMOJI",
+  "attachments": [
+    {
+      "fallback": "",
+      "title": "$(current_commit)",
+      "text": "$message",
+      "title_link": "",
+      "color": "$(slack_color)",
+      "fields": [
+        $(slack_deployed_by_field),
+        $(slack_branch_field),
+        $(slack_site_field)
+      ]
+    }
+  ]
+}
+END
+}
+
+slack_notify() {
+  local payload
+  payload="$(slack_payload)"
+
+  curl -s -d "payload=$payload" "$SLACK_URL" > /dev/null
+}
+
+#
+# main
+#
+main() {
+  # Create tmp directory for persisted sockets
+  mkdir -p tmp/sockets
+
+  while [[ $# -ne 0 ]]; do
+    arg="$1"
+    shift
+
+    case "$arg" in
+      -h|--help)
+        usage
+        exit
+        ;;
+
+      -V|--version)
+        version
+        exit
+        ;;
+
+      -c|--config)
+        set_config_path "$1"
+        shift ;;
+
+      -C|--chdir)
+        log "path/sourced $1"
+        cd "$1" || exit 1
+        shift
+        ;;
+
+      run)
+        require_env;
+        run "cd $(config_get path) && $*"
+        exit
+        ;;
+
+      connect)
+        require_env
+        connect
+        exit
+        ;;
+
+      curr|current)
+        require_env
+        current_commit
+        exit
+        ;;
+
+      setup)
+        require_env
+        setup "$@"
+        exit
+        ;;
+
+      staging|production)
+        bin/deploy "$arg-web"
+        bin/deploy "$arg-worker"
+        exit
+        ;;
+
+      config)
+        config "$@"
+        exit
+        ;;
+
+      *)
+        if [[ -z "$ENV" ]]; then
+          ENV=$arg
+        else
+          REF="$REF $arg"
+        fi
+        ;;
+    esac
+  done
+
+  require_env
+  # check_for_local_changes
+
+  # Deploy
+  deploy "${REF:-$(config_get ref)}"
+}
+
+main "$@"

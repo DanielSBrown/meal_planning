@@ -1,0 +1,17 @@
+#!/usr/bin/env bash
+
+# bin/ci: Setup environment for CI to run tests. This is primarily
+#         designed to run on the continuous integration server.
+#
+# When to use:
+#   - Invoked only in a CI environment
+
+set -e
+
+cd "$(dirname "$0")/.."
+export ENV="test"
+
+echo "Running tests…"
+date "+%H:%M:%S"
+
+bin/cov

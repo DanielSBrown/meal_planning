@@ -1,0 +1,8 @@
+#!/bin/bash
+
+echo "Installing node modules ..."
+# Verify node_modules are up to date
+yarn install
+
+echo "Waiting for django service to be up ..."
+./.docker/util/wait-for-it.sh django:8000 --timeout=0 -- yarn start

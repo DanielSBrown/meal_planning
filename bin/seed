@@ -1,0 +1,14 @@
+#!/usr/bin/env bash
+
+# bin/seed: Runs the seed.py script
+#
+# NOTE: this is all that is run in bin/reset. They function basically the same here,
+#       however, conceptually they may be different on most projects
+#
+# When to use:
+#           it manually
+#   - After switching branches or pulling down new changes and getting odd errors
+
+set -e
+
+docker compose run --rm django python manage.py seed

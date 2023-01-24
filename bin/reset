@@ -1,0 +1,13 @@
+#!/usr/bin/env bash
+
+# bin/reset: Reset application with fresh migrations with the database seeded.
+#
+# NOTE: this is a manually run operation, so that you don't lose data
+#
+# When to use:
+#           it manually
+#   - After switching branches or pulling down new changes and getting odd errors
+
+set -e
+
+bin/seed
