@@ -14,3 +14,7 @@ django-anymail==8.6
 celery==5.2.7
 redis==4.0.2  # https://github.com/redis/redis-py
 django-redis==5.2.0  # https://github.com/jazzband/django-redis
+beautifulsoup4==4.11.2 # https://www.crummy.com/software/BeautifulSoup/bs4/doc/
+selenium==4.8.0 # https://selenium-python.readthedocs.io/
+fake-useragent==1.1.1
+lxml==4.9.2
